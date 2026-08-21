@@ -1,12 +1,10 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-
-app = FastAPI(title="OSINT Corroboration Engine")
-
+app = FastAPI()
 
 ALLOWED_TYPES = {
     "dns",
@@ -17,64 +15,50 @@ ALLOWED_TYPES = {
 }
 
 
-def invalid_response():
+def make_result(verdict: str, confidence: str, sources: list[str]):
     return {
-        "verdict": "invalid",
-        "confidence": "low",
-        "corroboratingSources": [],
+        "verdict": verdict,
+        "confidence": confidence,
+        "corroboratingSources": sources,
     }
 
 
 def parse_timestamp(value: Any):
-    """
-    Parse an ISO-8601 timestamp.
-
-    Returns a timezone-aware datetime, or None if invalid.
-    """
     if not isinstance(value, str):
         return None
 
     try:
-        # Support timestamps ending in Z.
-        normalized = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(normalized)
+        text = value
 
-        # Treat a timestamp without timezone information as invalid.
-        if dt.tzinfo is None:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        parsed = datetime.fromisoformat(text)
+
+        if parsed.tzinfo is None:
             return None
 
-        return dt.astimezone(timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
-def is_fresh(as_of: datetime, observed_at: datetime, staleness_days: float):
-    """
-    A source is fresh when:
-
-        asOf - observedAt <= stalenessDays
-
-    Older observations are stale.
-    """
-    age = as_of - observed_at
-
-    return age.total_seconds() <= staleness_days * 86400
-
-
-def valid_source(source: Any):
-    """
-    Check whether an individual source satisfies the assignment's
-    source validity rules.
-    """
+def is_valid_source(source: Any) -> bool:
     if not isinstance(source, dict):
         return False
 
-    required_strings = ["id", "origin", "value", "observedAt"]
+    if not isinstance(source.get("id"), str):
+        return False
 
-    for field in required_strings:
-        if not isinstance(source.get(field), str):
-            return False
+    if not isinstance(source.get("origin"), str):
+        return False
+
+    if not isinstance(source.get("value"), str):
+        return False
+
+    if not isinstance(source.get("observedAt"), str):
+        return False
 
     if source.get("type") not in ALLOWED_TYPES:
         return False
@@ -82,129 +66,210 @@ def valid_source(source: Any):
     return True
 
 
+def is_fresh(
+    as_of: datetime,
+    observed_at: datetime,
+    staleness_days: float
+) -> bool:
+
+    age_seconds = (as_of - observed_at).total_seconds()
+
+    return age_seconds <= staleness_days * 86400
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.post("/corroborate")
-async def corroborate(body: Any):
-    # ---------------------------------------------------------
-    # RULE 1: INVALID REQUEST
-    # ---------------------------------------------------------
+async def corroborate(request: Request):
+
+    # --------------------------------------------------
+    # Read JSON manually.
+    #
+    # This is important because the assignment requires
+    # us to return "invalid" for certain bad requests,
+    # rather than FastAPI returning HTTP 422.
+    # --------------------------------------------------
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
+
+    # --------------------------------------------------
+    # RULE 1
+    # --------------------------------------------------
 
     if not isinstance(body, dict):
-        return JSONResponse(content=invalid_response())
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
 
     claim = body.get("claim")
 
     if not isinstance(claim, dict):
-        return JSONResponse(content=invalid_response())
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
 
     if not isinstance(claim.get("value"), str):
-        return JSONResponse(content=invalid_response())
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
 
     as_of = parse_timestamp(body.get("asOf"))
 
     if as_of is None:
-        return JSONResponse(content=invalid_response())
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
 
     staleness_days = body.get("stalenessDays")
 
-    # bool is technically a subclass of int in Python.
-    # We don't want true/false to count as a number here.
-    if isinstance(staleness_days, bool) or not isinstance(
-        staleness_days, (int, float)
-    ):
-        return JSONResponse(content=invalid_response())
+    if isinstance(staleness_days, bool):
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
+
+    if not isinstance(staleness_days, (int, float)):
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
 
     sources = body.get("sources")
 
     if not isinstance(sources, list):
-        return JSONResponse(content=invalid_response())
+        return JSONResponse(
+            status_code=200,
+            content=make_result("invalid", "low", [])
+        )
 
     claim_value = claim["value"]
 
-    # ---------------------------------------------------------
-    # KEEP ONLY VALID + FRESH SOURCES
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # Keep only valid and fresh sources
+    # --------------------------------------------------
 
     fresh_sources = []
 
     for source in sources:
-        # Invalid individual sources are ignored entirely.
-        if not valid_source(source):
+
+        if not is_valid_source(source):
             continue
 
         observed_at = parse_timestamp(source["observedAt"])
 
-        # Invalid observedAt means this source cannot be used.
         if observed_at is None:
             continue
 
-        if not is_fresh(as_of, observed_at, staleness_days):
+        if not is_fresh(
+            as_of,
+            observed_at,
+            staleness_days
+        ):
             continue
 
         fresh_sources.append(source)
 
-    # ---------------------------------------------------------
-    # RULE 2: AUTHORITATIVE CONTRADICTION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # RULE 2
+    #
+    # Fresh authoritative source contradicts claim.
+    # --------------------------------------------------
 
-    contradicting_sources = [
-        source
-        for source in fresh_sources
-        if source.get("authoritative") is True
-        and source["value"] != claim_value
-    ]
+    contradictions = []
 
-    if contradicting_sources:
+    for source in fresh_sources:
+
+        if source.get("authoritative") is True:
+            if source["value"] != claim_value:
+                contradictions.append(source)
+
+    if contradictions:
+
         ids = sorted(
             source["id"]
-            for source in contradicting_sources
+            for source in contradictions
         )
 
         return JSONResponse(
-            content={
-                "verdict": "contradicted",
-                "confidence": "low",
-                "corroboratingSources": ids,
-            }
+            status_code=200,
+            content=make_result(
+                "contradicted",
+                "low",
+                ids
+            )
         )
 
-    # ---------------------------------------------------------
-    # RULE 3: SUPPORTING SOURCES
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # RULE 3
+    #
+    # Find fresh sources agreeing with claim.
+    # --------------------------------------------------
 
-    agreeing_sources = [
-        source
-        for source in fresh_sources
-        if source["value"] == claim_value
-    ]
+    agreeing_sources = []
 
-    # Group sources by origin.
+    for source in fresh_sources:
+
+        if source["value"] == claim_value:
+            agreeing_sources.append(source)
+
+    # --------------------------------------------------
+    # Group by origin.
     #
     # Same origin = mirrors.
-    # Each origin can contribute only one representative.
+    # Keep lexicographically smallest ID.
+    # --------------------------------------------------
+
     representatives = {}
 
     for source in agreeing_sources:
+
         origin = source["origin"]
 
         if origin not in representatives:
+
             representatives[origin] = source
+
         else:
-            # Choose lexicographically smallest ID.
-            if source["id"] < representatives[origin]["id"]:
+
+            current = representatives[origin]
+
+            if source["id"] < current["id"]:
                 representatives[origin] = source
 
-    representative_sources = list(representatives.values())
+    representatives = list(representatives.values())
 
-    # Need at least two independent origins.
-    if len(representative_sources) >= 2:
-        representative_ids = sorted(
+    # --------------------------------------------------
+    # Need at least TWO independent origins.
+    # --------------------------------------------------
+
+    if len(representatives) >= 2:
+
+        ids = sorted(
             source["id"]
-            for source in representative_sources
+            for source in representatives
         )
 
         types = {
             source["type"]
-            for source in representative_sources
+            for source in representatives
         }
 
         if len(types) >= 2:
@@ -213,21 +278,23 @@ async def corroborate(body: Any):
             confidence = "medium"
 
         return JSONResponse(
-            content={
-                "verdict": "supported",
-                "confidence": confidence,
-                "corroboratingSources": representative_ids,
-            }
+            status_code=200,
+            content=make_result(
+                "supported",
+                confidence,
+                ids
+            )
         )
 
-    # ---------------------------------------------------------
-    # RULE 4: UNVERIFIED
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # RULE 4
+    # --------------------------------------------------
 
     return JSONResponse(
-        content={
-            "verdict": "unverified",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
+        status_code=200,
+        content=make_result(
+            "unverified",
+            "low",
+            []
+        )
     )
